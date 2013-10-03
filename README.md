@@ -1,4 +1,4 @@
-SMVTK-Multiclass-Classifier
+SVMTK-Multiclass-Classifier
 ===========================
 
 ## Description

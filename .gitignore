@@ -1,2 +1,4 @@
 *.pyc
 *.o
+sample-data/
+SVM-Light-1.5-rer/
