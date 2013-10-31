@@ -2,3 +2,5 @@
 *.o
 sample-data/
 SVM-Light-1.5-rer/
+libsvm-2.91/
+liblinear-1.93/

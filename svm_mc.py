@@ -1,13 +1,14 @@
 from __future__ import division
 import os
+import re
 import random
 import logging
 import multiprocessing
 from collections import defaultdict
 from sklearn import metrics
-from svmtk import SVMTK
+from svm import SVMTK, LibLinear, LibSVM
 
-
+SVMTK_FVEC_PAT = re.compile(r"(?P<label>\S+)\s+.*\|(ET|BV)\| (?P<vector>.*) \|EV\|")
 logging.basicConfig(format='%(asctime)s : %(levelname)s : %(message)s', level=logging.INFO)
 
 random.seed(123)
@@ -17,26 +18,35 @@ NFOLDS = 5
 
 
 def unwrap_self_svmtrain(arg, **kwarg):
-  return MultiClassSVMTK.svm_train(*arg, **kwarg)
+  return MultiClassSVM.svm_train(*arg, **kwarg)
 
 
 def unwrap_self_svmtest(arg, **kwarg):
-  return MultiClassSVMTK.svm_test(*arg, **kwarg)
+  return MultiClassSVM.svm_test(*arg, **kwarg)
 
 
-class MultiClassSVMTK:
-  def __init__(self, train, ova_dir="ova", tk_params="-t 5 -C V", ncpus=None, quite=True):
+class MultiClassSVM:
+  def __init__(self, 
+               train, 
+               binary_svm,
+               ova_dir="ova", 
+               params="-t 5 -C V", 
+               ncpus=None, 
+               quite=True):
     self.dir = os.path.dirname(train)
     self.ova_path = os.path.join(self.dir, ova_dir)
     self.ncpus = ncpus
     self.quite = quite
-    self.svm = SVMTK(tk_params)
-    self.tk_params_str = "_".join(tk_params.split())
-    self.model_suff = self.tk_params_str + ".model"
-    self.pred_suff = self.tk_params_str + ".pred"
+    self.svm = binary_svm
+    self.params_str = "_".join(params.split())
+    self.model_suff = self.params_str + ".model"
+    self.pred_suff = self.params_str + ".pred"
 
     examples = []
     cat2ex = defaultdict(list)
+    if not isinstance(self.svm, SVMTK):
+      train = self.convert_svmtk_to_svmlight(train)
+
     for line in open(train):
       label, vec = line.strip().split(" ", 1)
       ex = (label, vec)
@@ -92,8 +102,27 @@ class MultiClassSVMTK:
       files = (os.path.join(self.ova_path, "{}.{}".format(cat, ftype)) for ftype in file_types)
       yield files
 
-  def train(self):
-    self.create_ova_data()
+  def _extract_fvec_from_svmtk_file(self, fname, outfname):
+    with open(outfname, "w") as out:
+      for line in open(fname):
+        match = SVMTK_FVEC_PAT.match(line.strip())
+        if match:
+          label = match.group("label")
+          fvec = match.group("vector")
+          out.write("{} {}\n".format(label, fvec))
+        else:
+          raise TypeError("Failed to parse SVM-TK example. Check formatting: {}".format(line))
+
+  def convert_svmtk_to_svmlight(self, fname):
+    ex = open(fname).readline().strip()
+    match = SVMTK_FVEC_PAT.match(ex)
+    if match:
+      outfname = fname + ".fvec.liblinear"
+      self._extract_fvec_from_svmtk_file(fname, outfname)
+      fname = outfname
+    return fname
+
+  def _train(self):
     if self.ncpus:
       pool = multiprocessing.Pool(self.ncpus)
       args = [(self, train, model, self.quite) for train, model 
@@ -104,7 +133,23 @@ class MultiClassSVMTK:
       for (train, model) in self.iterate_svm_files(["train", self.model_suff]):
         self.svm_train(train, model, quite=self.quite)
 
+  def train(self):
+    self.create_ova_data()
+    self._train()
+  
+
   def test(self, test_file):
+    if not isinstance(self.svm, SVMTK):
+      test_file = self.convert_svmtk_to_svmlight(test_file)
+      # Liblinear doesn't accept string labels (so need to replace them with 1.0)
+      if isinstance(self.svm, LibLinear):
+        nolabel_test_file = test_file + ".nolabel"
+        with open(nolabel_test_file, "w") as out:
+          for line in open(test_file):
+            label, ex = line.strip().split(" ", 1)
+            out.write("1.0 {}\n".format(ex))
+        test_file = nolabel_test_file
+
     if self.ncpus:
       pool = multiprocessing.Pool(self.ncpus)
       args = [(self, test_file, model, pred, self.quite) for (model, pred) 
@@ -143,13 +188,15 @@ class MultiClassSVMTK:
     self.test(test)
     self.eval(test)
 
-  def print_metrics(self, y_true, y_pred, print_averages=False):
+  def print_metrics(self, y_true, y_pred, print_averages=True):
     print
     print "{:^30}".format("Confusion matrix")
-    print "{:>8} {}".format("gs\pred", " ".join("{:>8}".format(c) for c in self.categories))
-    for cat, predictions in zip(self.categories, metrics.confusion_matrix(y_true, y_pred)):
-      vals = " ".join("{:>8d}".format(p) for p in predictions)
-      print "{:>8s} {}".format(cat, vals)
+    categories = sorted(self.categories)
+    labels = " ".join("{:>10}".format(c) for c in categories)
+    print "{:>10} {} {:>10}".format("gold\pred", labels, "total")
+    for cat, predictions in zip(categories, metrics.confusion_matrix(y_true, y_pred)):
+      vals = " ".join("{:>10d}".format(p) for p in predictions)
+      print "{:>10} {} {:>10}".format(cat, vals, sum(predictions))
     print
 
     acc = metrics.accuracy_score(y_true, y_pred)
@@ -186,7 +233,7 @@ class MultiClassSVMTK:
 def test_ova():
   train = "/Users/aseveryn/PhD/soft/SVMS/jlis-0.5/data/multiclass/small.train"
   test = "/Users/aseveryn/PhD/soft/SVMS/jlis-0.5/data/multiclass/small.test"
-  mc = MultiClassSVMTK(train, ncpus=2)
+  mc = MultiClassSVM(train, ncpus=2)
   mc.train_test_eval(test)
   
 
@@ -220,22 +267,48 @@ def main():
                 type=int, default=None,
                 help="number of CPUs.")
 
-  op.add_option("--tk_params", default="-t 5 -C V", 
+  op.add_option("--params", default="-t 5 -C V", 
                 help="paramerters for SVM-TK")
+
+  op.add_option("--svm_folder", default=None, 
+                help="folder with svm.train and svm.test")
+
+  op.add_option("--svm", default="svmtk", 
+                help="back-end binary svm to use: [svmtk,liblinear]")
+
+  op.add_option("--optimize_j",
+                action="store_true", default=False,
+                help="optimize -j parameter (only for SVMTK)")
+
 
   (opts, args) = op.parse_args()
   
-  if len(args) != 2:
-      op.print_help()
-      op.error("this script takes exactly two argument.")
+  if opts.svm_folder:
+    train_file = os.path.join(opts.svm_folder, "svm.train")
+    test_file = os.path.join(opts.svm_folder, "svm.test")
+  else:
+    if len(args) != 2:
+        op.print_help()
+        op.error("this script takes exactly two argument.")
+    train_file = args[0]
+    test_file = args[1]
 
-  train_file = args[0]
-  test_file = args[1]
-  mc = MultiClassSVMTK(train_file, 
-                       tk_params=opts.tk_params, 
-                       ova_dir=opts.ova_dir, 
-                       ncpus=opts.ncpus, 
-                       quite=opts.quite)
+
+  if opts.svm == "svmtk":
+    svm = SVMTK(opts.params, optimize_j=opts.optimize_j)
+  elif opts.svm == "liblinear":
+    svm = LibLinear(opts.params)
+  elif opts.svm == "libsvm":
+    svm = LibSVM(opts.params)
+  else:
+    raise TypeError("Unsupported binary svm type %s" % opts.svm)
+
+  mc = MultiClassSVM(train_file, 
+                     binary_svm=svm,
+                     params=opts.params, 
+                     ova_dir=opts.ova_dir, 
+                     ncpus=opts.ncpus, 
+                     quite=opts.quite)
   mc.print_stats()
   if opts.train:
     mc.train()
